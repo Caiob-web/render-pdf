@@ -1,0 +1,74 @@
+import puppeteer from "puppeteer-core";
+import chromium from "@sparticuz/chromium-min";
+
+export const runtime = "nodejs";
+export const maxDuration = 60;
+export const dynamic = "force-dynamic";
+
+function cors(extra: Record<string, string> = {}) {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, x-api-key",
+    ...extra,
+  };
+}
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: cors() });
+}
+
+export async function POST(req: Request) {
+  const expectedKey = process.env.PDF_RENDER_KEY || "";
+  if (expectedKey) {
+    const got = req.headers.get("x-api-key") || "";
+    if (got !== expectedKey) return new Response("Unauthorized", { status: 401, headers: cors() });
+  }
+
+  let payload: any = {};
+  try {
+    payload = await req.json();
+  } catch {
+    return new Response("Body JSON inválido", { status: 400, headers: cors() });
+  }
+
+  const html = payload?.html;
+  const pdfOptions = payload?.pdfOptions || {};
+  if (!html || typeof html !== "string") {
+    return new Response("Missing html", { status: 400, headers: cors() });
+  }
+
+  let browser: any;
+  try {
+    browser = await puppeteer.launch({
+      args: chromium.args,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      defaultViewport: chromium.defaultViewport,
+    });
+
+    const page = await browser.newPage();
+    page.setDefaultTimeout(45000);
+
+    await page.setContent(html, { waitUntil: "load" });
+
+    const pdf = await page.pdf({
+      format: "A4",
+      printBackground: true,
+      preferCSSPageSize: true,
+      ...pdfOptions,
+    });
+
+    return new Response(pdf, {
+      status: 200,
+      headers: cors({
+        "Content-Type": "application/pdf",
+        "Cache-Control": "no-store",
+      }),
+    });
+  } catch (e: any) {
+    return new Response(String(e?.message || e), { status: 500, headers: cors() });
+  } finally {
+    try { await browser?.close(); } catch {}
+  }
+}
