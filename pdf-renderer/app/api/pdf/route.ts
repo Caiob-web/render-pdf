@@ -1,5 +1,5 @@
 import puppeteer from "puppeteer-core";
-import chromium from "@sparticuz/chromium-min";
+import chromium from "@sparticuz/chromium";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -22,7 +22,9 @@ export async function POST(req: Request) {
   const expectedKey = process.env.PDF_RENDER_KEY || "";
   if (expectedKey) {
     const got = req.headers.get("x-api-key") || "";
-    if (got !== expectedKey) return new Response("Unauthorized", { status: 401, headers: cors() });
+    if (got !== expectedKey) {
+      return new Response("Unauthorized", { status: 401, headers: cors() });
+    }
   }
 
   let payload: any = {};
@@ -34,11 +36,13 @@ export async function POST(req: Request) {
 
   const html = payload?.html;
   const pdfOptions = payload?.pdfOptions || {};
+
   if (!html || typeof html !== "string") {
     return new Response("Missing html", { status: 400, headers: cors() });
   }
 
-  let browser: any;
+  let browser: puppeteer.Browser | null = null;
+
   try {
     browser = await puppeteer.launch({
       args: chromium.args,
@@ -64,11 +68,14 @@ export async function POST(req: Request) {
       headers: cors({
         "Content-Type": "application/pdf",
         "Cache-Control": "no-store",
+        "Content-Disposition": 'attachment; filename="notificacao.pdf"',
       }),
     });
   } catch (e: any) {
     return new Response(String(e?.message || e), { status: 500, headers: cors() });
   } finally {
-    try { await browser?.close(); } catch {}
+    try {
+      await browser?.close();
+    } catch {}
   }
 }
