@@ -1,5 +1,6 @@
 import puppeteer from "puppeteer-core";
 import chromium from "@sparticuz/chromium";
+import type { Browser } from "puppeteer-core";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -41,14 +42,15 @@ export async function POST(req: Request) {
     return new Response("Missing html", { status: 400, headers: cors() });
   }
 
-  let browser: puppeteer.Browser | null = null;
+  const c: any = chromium; // resolve tipagem do TS em algumas versões
+
+  let browser: Browser | null = null;
 
   try {
     browser = await puppeteer.launch({
-      args: chromium.args,
-      executablePath: await chromium.executablePath(),
-      headless: chromium.headless,
-      defaultViewport: chromium.defaultViewport,
+      args: c.args,
+      executablePath: await c.executablePath(),
+      headless: c.headless ?? "new",
     });
 
     const page = await browser.newPage();
@@ -56,14 +58,18 @@ export async function POST(req: Request) {
 
     await page.setContent(html, { waitUntil: "load" });
 
-    const pdf = await page.pdf({
+    const pdfBuffer = await page.pdf({
       format: "A4",
       printBackground: true,
       preferCSSPageSize: true,
       ...pdfOptions,
     });
 
-    return new Response(pdf, {
+    // Garante que o body é um tipo aceito pela Response (evita erro de TS)
+    const pdfBytes =
+      pdfBuffer instanceof Uint8Array ? pdfBuffer : new Uint8Array(pdfBuffer as any);
+
+    return new Response(pdfBytes, {
       status: 200,
       headers: cors({
         "Content-Type": "application/pdf",
