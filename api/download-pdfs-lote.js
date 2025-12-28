@@ -1,13 +1,15 @@
+// api/download-pdfs-lote.js
+
 let JSZip;
 
 try {
-  // tenta carregar a lib; se não estiver instalada, a gente trata mais embaixo
-  JSZip = require('jszip');
+  // tenta carregar a lib; se não estiver instalada, loga erro
+  JSZip = require("jszip");
 } catch (e) {
-  console.error('jszip não encontrado. Rode "npm install jszip".', e);
+  console.error("jszip não encontrado. Rode `npm install jszip`.", e);
 }
 
-// função utilitária: baixa uma URL e devolve Buffer (ou null + erro)
+// helper: baixa um PDF e devolve Buffer (ou cria txt de erro no zip)
 async function fetchPdfToBuffer(url, index, zip) {
   try {
     const response = await fetch(url);
@@ -33,57 +35,69 @@ async function fetchPdfToBuffer(url, index, zip) {
 }
 
 module.exports = async (req, res) => {
-  if (!JSZip) {
-    return res.status(500).json({
-      error: 'Dependência jszip não encontrada no servidor.'
-    });
+  // --------- CORS (libera chamada do Base44 / navegador) ----------
+  const origin = req.headers.origin || "*";
+  res.setHeader("Access-Control-Allow-Origin", origin);
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  // Preflight (OPTIONS)
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
   }
 
-  const method = (req.method || 'GET').toUpperCase();
+  if (!JSZip) {
+    return res
+      .status(500)
+      .json({ error: "Dependência jszip não encontrada no servidor." });
+  }
+
+  const method = (req.method || "GET").toUpperCase();
 
   try {
     let urls = [];
 
-    // ---------- MODO POST: JSON no corpo ----------
-    if (method === 'POST') {
+    // ----------------- MODO POST: body JSON { urls: [...] } -----------------
+    if (method === "POST") {
       let body = req.body;
 
-      // Se o body vier vazio, lê o stream manualmente
+      // alguns runtimes não populam req.body → ler stream manualmente
       if (!body) {
         const chunks = [];
         for await (const chunk of req) {
           chunks.push(chunk);
         }
-        const raw = Buffer.concat(chunks).toString('utf8') || '{}';
+        const raw = Buffer.concat(chunks).toString("utf8") || "{}";
         try {
           body = JSON.parse(raw);
         } catch (e) {
           return res
             .status(400)
-            .json({ error: 'JSON inválido no corpo da requisição.' });
+            .json({ error: "JSON inválido no corpo da requisição." });
         }
-      } else if (typeof body === 'string') {
+      } else if (typeof body === "string") {
         try {
           body = JSON.parse(body);
         } catch (e) {
           return res
             .status(400)
-            .json({ error: 'JSON inválido no corpo da requisição.' });
+            .json({ error: "JSON inválido no corpo da requisição." });
         }
       }
 
-      urls = Array.isArray(body.urls) ? body.urls : [];
+      urls = Array.isArray(body?.urls) ? body.urls : [];
     }
 
-    // ---------- MODO GET: ?urls=url1,url2,url3 ----------
-    else if (method === 'GET') {
+    // ----------------- MODO GET: ?urls=url1,url2,url3 -----------------
+    else if (method === "GET") {
       const q = req.query && req.query.urls;
 
       if (Array.isArray(q)) {
         urls = q.filter(Boolean);
-      } else if (typeof q === 'string') {
+      } else if (typeof q === "string") {
         urls = q
-          .split(',')
+          .split(",")
           .map((s) => s.trim())
           .filter(Boolean);
       } else {
@@ -94,18 +108,18 @@ module.exports = async (req, res) => {
       }
     }
 
-    // ---------- Outros métodos: bloqueia ----------
+    // ----------------- OUTROS MÉTODOS: bloqueia -----------------
     else {
-      res.setHeader('Allow', 'GET, POST');
+      res.setHeader("Allow", "GET, POST, OPTIONS");
       return res
         .status(405)
-        .json({ error: 'Use métodos GET (com query) ou POST (com JSON).' });
+        .json({ error: "Use métodos GET, POST ou OPTIONS." });
     }
 
     if (!urls || !urls.length) {
       return res.status(400).json({
         error:
-          'Lista de URLs vazia. Envie pelo menos uma URL de PDF em "urls".'
+          'Lista de URLs vazia. Envie pelo menos uma URL em "urls".'
       });
     }
 
@@ -114,7 +128,7 @@ module.exports = async (req, res) => {
     for (let i = 0; i < urls.length; i++) {
       const url = urls[i];
 
-      if (!url || typeof url !== 'string') {
+      if (!url || typeof url !== "string") {
         zip.file(
           `ERRO_${i + 1}.txt`,
           `URL inválida na posição ${i + 1}: ${JSON.stringify(url)}`
@@ -126,27 +140,27 @@ module.exports = async (req, res) => {
       if (!buffer) continue;
 
       // tenta extrair nome do arquivo
-      let fileName = url.split('/').pop() || `arquivo-${i + 1}.pdf`;
-      if (!fileName.toLowerCase().endsWith('.pdf')) {
+      let fileName = url.split("/").pop() || `arquivo-${i + 1}.pdf`;
+      if (!fileName.toLowerCase().endsWith(".pdf")) {
         fileName = `${fileName}.pdf`;
       }
 
       zip.file(fileName, buffer);
     }
 
-    const zipBuffer = await zip.generateAsync({ type: 'nodebuffer' });
+    const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
 
-    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader("Content-Type", "application/zip");
     res.setHeader(
-      'Content-Disposition',
+      "Content-Disposition",
       'attachment; filename="lote-pdfs.zip"'
     );
 
     return res.status(200).send(zipBuffer);
   } catch (err) {
-    console.error('Erro geral na rota /api/download-pdfs-lote:', err);
+    console.error("Erro geral na rota /api/download-pdfs-lote:", err);
     return res.status(500).json({
-      error: 'Erro interno ao gerar o ZIP',
+      error: "Erro interno ao gerar o ZIP",
       details: err.message
     });
   }
