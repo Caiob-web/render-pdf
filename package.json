@@ -1,7 +1,8 @@
 {
-  "name": "vercel-pdf-render",
+  "name": "render-pdf",
   "version": "1.0.0",
-  "type": "module",
+  "description": "PDF render simples via Vercel",
+  "main": "index.js",
   "dependencies": {
     "pdf-lib": "^1.17.1"
   }
