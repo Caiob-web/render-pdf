@@ -1,9 +1,10 @@
 {
   "name": "render-pdf",
   "version": "1.0.0",
-  "description": "PDF render simples via Vercel",
+  "description": "Render PDF e download em lote",
   "main": "index.js",
   "dependencies": {
-    "pdf-lib": "^1.17.1"
+    "pdf-lib": "^1.17.1",
+    "jszip": "^3.10.1"
   }
 }
