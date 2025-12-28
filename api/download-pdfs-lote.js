@@ -1,68 +1,32 @@
 // api/download-pdfs-lote.js
+// Converte páginas HTML em PDFs (via Puppeteer) e devolve tudo num ZIP
 
-let JSZip;
-
-try {
-  // tenta carregar a lib; se não estiver instalada, loga erro
-  JSZip = require("jszip");
-} catch (e) {
-  console.error("jszip não encontrado. Rode `npm install jszip`.", e);
-}
-
-// helper: baixa um PDF e devolve Buffer (ou cria txt de erro no zip)
-async function fetchPdfToBuffer(url, index, zip) {
-  try {
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      zip.file(
-        `ERRO_${index + 1}.txt`,
-        `Falha ao baixar ${url}: HTTP ${response.status}`
-      );
-      return null;
-    }
-
-    const arrayBuffer = await response.arrayBuffer();
-    return Buffer.from(arrayBuffer);
-  } catch (err) {
-    console.error(`Erro ao baixar ${url}:`, err);
-    zip.file(
-      `ERRO_${index + 1}.txt`,
-      `Erro ao baixar ${url}: ${err.message}`
-    );
-    return null;
-  }
-}
+const chromium = require("@sparticuz/chromium");
+const puppeteer = require("puppeteer-core");
+const JSZip = require("jszip");
 
 module.exports = async (req, res) => {
-  // --------- CORS (libera chamada do Base44 / navegador) ----------
+  // ---------- CORS ----------
   const origin = req.headers.origin || "*";
   res.setHeader("Access-Control-Allow-Origin", origin);
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  // Preflight (OPTIONS)
   if (req.method === "OPTIONS") {
     return res.status(204).end();
-  }
-
-  if (!JSZip) {
-    return res
-      .status(500)
-      .json({ error: "Dependência jszip não encontrada no servidor." });
   }
 
   const method = (req.method || "GET").toUpperCase();
 
   try {
+    // ---------- 1) Ler URLs da requisição ----------
     let urls = [];
 
-    // ----------------- MODO POST: body JSON { urls: [...] } -----------------
     if (method === "POST") {
       let body = req.body;
 
-      // alguns runtimes não populam req.body → ler stream manualmente
+      // se o runtime não populou req.body, lê o stream manualmente
       if (!body) {
         const chunks = [];
         for await (const chunk of req) {
@@ -87,81 +51,107 @@ module.exports = async (req, res) => {
       }
 
       urls = Array.isArray(body?.urls) ? body.urls : [];
-    }
-
-    // ----------------- MODO GET: ?urls=url1,url2,url3 -----------------
-    else if (method === "GET") {
+    } else if (method === "GET") {
+      // ?urls=url1,url2,url3 (URL-encoded)
       const q = req.query && req.query.urls;
-
       if (Array.isArray(q)) {
         urls = q.filter(Boolean);
       } else if (typeof q === "string") {
         urls = q
           .split(",")
-          .map((s) => s.trim())
+          .map((s) => decodeURIComponent(s.trim()))
           .filter(Boolean);
       } else {
         return res.status(400).json({
           error:
-            'Envie ?urls=url1,url2,url3 ou use POST com {"urls":["url1","url2"]}.'
+            'Envie ?urls=url1,url2,url3 ou use POST com {"urls":["url1","url2"]}.',
         });
       }
-    }
-
-    // ----------------- OUTROS MÉTODOS: bloqueia -----------------
-    else {
+    } else {
       res.setHeader("Allow", "GET, POST, OPTIONS");
-      return res
-        .status(405)
-        .json({ error: "Use métodos GET, POST ou OPTIONS." });
+      return res.status(405).json({ error: "Use GET, POST ou OPTIONS." });
     }
 
-    if (!urls || !urls.length) {
+    if (!urls.length) {
       return res.status(400).json({
         error:
-          'Lista de URLs vazia. Envie pelo menos uma URL em "urls".'
+          'Lista de URLs vazia. Envie pelo menos uma URL em "urls".',
       });
     }
 
-    const zip = new JSZip();
-
-    for (let i = 0; i < urls.length; i++) {
-      const url = urls[i];
-
-      if (!url || typeof url !== "string") {
-        zip.file(
-          `ERRO_${i + 1}.txt`,
-          `URL inválida na posição ${i + 1}: ${JSON.stringify(url)}`
-        );
-        continue;
-      }
-
-      const buffer = await fetchPdfToBuffer(url, i, zip);
-      if (!buffer) continue;
-
-      // tenta extrair nome do arquivo
-      let fileName = url.split("/").pop() || `arquivo-${i + 1}.pdf`;
-      if (!fileName.toLowerCase().endsWith(".pdf")) {
-        fileName = `${fileName}.pdf`;
-      }
-
-      zip.file(fileName, buffer);
+    // opcional: limitar quantidade para não estourar memória/tempo
+    const MAX_URLS = 20;
+    if (urls.length > MAX_URLS) {
+      urls = urls.slice(0, MAX_URLS);
     }
 
-    const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+    // ---------- 2) Sobe o Chromium (Puppeteer) ----------
+    const executablePath = await chromium.executablePath();
 
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader(
-      "Content-Disposition",
-      'attachment; filename="lote-pdfs.zip"'
-    );
+    const browser = await puppeteer.launch({
+      args: chromium.args,
+      defaultViewport: chromium.defaultViewport,
+      executablePath,
+      headless: chromium.headless,
+    });
 
-    return res.status(200).send(zipBuffer);
+    const zip = new JSZip();
+
+    try {
+      // ---------- 3) Gera um PDF por URL ----------
+      for (let i = 0; i < urls.length; i++) {
+        const url = urls[i];
+
+        if (!url || typeof url !== "string") {
+          zip.file(
+            `ERRO_${i + 1}.txt`,
+            `URL inválida na posição ${i + 1}: ${JSON.stringify(url)}`
+          );
+          continue;
+        }
+
+        try {
+          const page = await browser.newPage();
+
+          await page.goto(url, {
+            waitUntil: "networkidle0",
+            timeout: 30000,
+          });
+
+          const pdfBuffer = await page.pdf({
+            format: "A4",
+            printBackground: true,
+          });
+
+          await page.close();
+
+          zip.file(`documento_${i + 1}.pdf`, pdfBuffer);
+        } catch (err) {
+          console.error(`Erro ao renderizar ${url}:`, err);
+          zip.file(
+            `ERRO_${i + 1}.txt`,
+            `Falha ao gerar PDF para ${url}: ${err.message || String(err)}`
+          );
+        }
+      }
+
+      // ---------- 4) Gera o ZIP ----------
+      const zipBuffer = await zip.generateAsync({ type: "nodebuffer" });
+
+      res.setHeader("Content-Type", "application/zip");
+      res.setHeader(
+        "Content-Disposition",
+        'attachment; filename="notificacoes.zip"'
+      );
+      return res.status(200).send(zipBuffer);
+    } finally {
+      await browser.close();
+    }
   } catch (err) {
     console.error("Erro geral na rota /api/download-pdfs-lote:", err);
     return res.status(500).json({
-      error: "Erro interno ao gerar o ZIP",
-      details: err.message
+      error: "Erro interno ao gerar PDFs",
+      details: err.message,
     });
   }
 };
