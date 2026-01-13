@@ -2,17 +2,20 @@
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium-min');
 const JSZip = require('jszip');
-const fs = require('fs');
-const path = require('path');
 
-const DEFAULT_LOGO_URL =
+const DEFAULT_LOGO_URL_OLD =
   'https://images.seeklogo.com/logo-png/62/2/edp-logo-png_seeklogo-621425.png';
+
+// ✅ Seu logo novo (pode virar ENV depois)
+const DEFAULT_LOGO_URL_NEW =
+  'https://captadores.org.br/wp-content/uploads/2024/08/edp.png';
 
 // Cache (serverless “warm” reaproveita)
 let _cachedExecutablePath = null;
 let _cachedLogoDataUri = null;
+let _cachedLogoAt = 0;
+const LOGO_TTL_MS = 6 * 60 * 60 * 1000; // 6 horas
 
-// -------- Helpers --------
 function readBody(req) {
   return new Promise((resolve, reject) => {
     let data = '';
@@ -50,42 +53,64 @@ function getPackUrl() {
 
 async function getExecutablePath() {
   if (_cachedExecutablePath) return _cachedExecutablePath;
-  const packUrl = getPackUrl();
-  _cachedExecutablePath = await chromium.executablePath(packUrl);
+  _cachedExecutablePath = await chromium.executablePath(getPackUrl());
   return _cachedExecutablePath;
 }
 
-// Lê o logo local do repo e vira data URI
-function getLogoDataUriFromLocalFile() {
-  if (_cachedLogoDataUri) return _cachedLogoDataUri;
-
-  const logoPath = path.join(process.cwd(), 'assets', 'edp-logo.png');
-
-  if (!fs.existsSync(logoPath)) {
-    throw new Error(
-      `Logo local não encontrado em ${logoPath}. Crie /assets/edp-logo.png e suba no GitHub.`
-    );
+// ✅ baixa o logo e transforma em data URI (base64)
+async function getLogoDataUri() {
+  const now = Date.now();
+  if (_cachedLogoDataUri && (now - _cachedLogoAt) < LOGO_TTL_MS) {
+    return _cachedLogoDataUri;
   }
 
-  const buf = fs.readFileSync(logoPath);
-  const b64 = buf.toString('base64');
-  _cachedLogoDataUri = `data:image/png;base64,${b64}`;
+  const logoUrl = (process.env.EDP_LOGO_URL || DEFAULT_LOGO_URL_NEW).trim();
+
+  // timeout do fetch (10s)
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 10000);
+
+  const resp = await fetch(logoUrl, {
+    signal: controller.signal,
+    headers: {
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36',
+      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8'
+    }
+  }).finally(() => clearTimeout(t));
+
+  if (!resp.ok) throw new Error(`Falha ao baixar logo (${resp.status})`);
+
+  const contentType = resp.headers.get('content-type') || 'image/png';
+  const arrayBuffer = await resp.arrayBuffer();
+  const base64 = Buffer.from(arrayBuffer).toString('base64');
+
+  _cachedLogoDataUri = `data:${contentType};base64,${base64}`;
+  _cachedLogoAt = now;
+
+  console.log('Logo baixado ok:', logoUrl, 'bytes:', Buffer.byteLength(base64, 'utf8'));
   return _cachedLogoDataUri;
 }
 
-// Injeta o logo no HTML
+// remove dependências externas que podem travar (opcional, mas ajuda no serverless)
+function stripExternalResources(html) {
+  let out = html;
+  out = out.replace(/<link[^>]+rel=["']preconnect["'][^>]*>\s*/gi, '');
+  out = out.replace(/<link[^>]+fonts\.googleapis\.com[^>]*>\s*/gi, '');
+  out = out.replace(/<link[^>]+fonts\.gstatic\.com[^>]*>\s*/gi, '');
+  return out;
+}
+
+// injeta logo no HTML
 function injectLogo(html, logoDataUri) {
   if (!logoDataUri) return html;
-
   let out = html;
 
-  out = out.split(DEFAULT_LOGO_URL).join(logoDataUri);
+  // troca URL antiga e também a nova, se aparecerem no HTML
+  out = out.split(DEFAULT_LOGO_URL_OLD).join(logoDataUri);
+  out = out.split(DEFAULT_LOGO_URL_NEW).join(logoDataUri);
 
-  out = out.replace(
-    /https?:\/\/images\.seeklogo\.com\/logo-png\/62\/2\/edp-logo-png_seeklogo-621425\.png/gi,
-    logoDataUri
-  );
-
+  // força em img alt="EDP Logo"
   out = out.replace(/<img\b([^>]*?)\balt\s*=\s*["']EDP Logo["']([^>]*?)>/gi, (m) => {
     const cleaned = m.replace(/\bsrc\s*=\s*["'][^"']*["']/i, '');
     return cleaned.replace('<img', `<img src="${logoDataUri}"`);
@@ -94,18 +119,10 @@ function injectLogo(html, logoDataUri) {
   return out;
 }
 
-// Espera fontes + imagens, mas com limite de tempo (pra não travar o lote)
-async function waitFontsAndImages(page, maxMs = 8000) {
-  // Coloca um “timer” do lado do Node: se estourar, a gente segue
+// espera rápida (não trava lote)
+async function quickWait(page, maxMs = 1200) {
   const guard = new Promise((resolve) => setTimeout(resolve, maxMs, 'timeout'));
-
   const work = page.evaluate(async () => {
-    // Fontes
-    if (document.fonts && document.fonts.ready) {
-      try { await document.fonts.ready; } catch (e) {}
-    }
-
-    // Imagens
     const imgs = Array.from(document.images || []);
     await Promise.all(
       imgs.map((img) => {
@@ -117,14 +134,16 @@ async function waitFontsAndImages(page, maxMs = 8000) {
       })
     );
 
+    if (document.fonts && document.fonts.ready) {
+      try { await document.fonts.ready; } catch (e) {}
+    }
+
     return 'done';
   });
 
-  // Corre a corrida: terminou ou estourou tempo, seguimos
   return Promise.race([work, guard]).catch(() => 'error');
 }
 
-// -------- Handler --------
 module.exports = async (req, res) => {
   // CORS
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -144,7 +163,9 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'Nenhum item fornecido para geração.' });
     }
 
-    const logoDataUri = getLogoDataUriFromLocalFile();
+    // ✅ pega o logo do link e transforma em base64
+    const logoDataUri = await getLogoDataUri();
+
     const executablePath = await getExecutablePath();
 
     browser = await puppeteer.launch({
@@ -153,12 +174,16 @@ module.exports = async (req, res) => {
       executablePath,
       headless: chromium.headless,
       ignoreHTTPSErrors: true,
-
-      // ✅ aqui é onde resolve seu erro
-      protocolTimeout: 180000 // 180s (3min)
+      protocolTimeout: 180000
     });
 
     const zip = new JSZip();
+
+    // ✅ reusa uma página (mais rápido)
+    const page = await browser.newPage();
+    page.setDefaultTimeout(120000);
+    page.setDefaultNavigationTimeout(120000);
+    await page.emulateMediaType('print');
 
     for (const item of items) {
       if (!item || !item.html) continue;
@@ -168,32 +193,19 @@ module.exports = async (req, res) => {
           ? item.filename.trim()
           : 'documento';
 
-      const page = await browser.newPage();
-
-      // timeouts “globais” da página
-      page.setDefaultTimeout(120000);
-      page.setDefaultNavigationTimeout(120000);
-
       try {
-        await page.emulateMediaType('print');
+        let html = item.html;
 
-        // (Opcional) log só de requests que interessam
-        page.on('requestfailed', (r) => {
-          const url = r.url();
-          if (url.includes('fonts.googleapis') || url.includes('gstatic') || url.includes('.png')) {
-            console.error('REQUEST FAILED:', url, r.failure()?.errorText);
-          }
-        });
+        // ajuda a não travar em rede
+        html = stripExternalResources(html);
 
-        const htmlToRender = injectLogo(item.html, logoDataUri);
+        // injeta o logo base64 (não depende mais de carregar imagem externa)
+        html = injectLogo(html, logoDataUri);
 
-        await page.setContent(htmlToRender, {
-          waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
-          timeout: 120000
-        });
+        await page.setContent(html, { waitUntil: ['domcontentloaded'], timeout: 120000 });
 
-        // ✅ espera fontes/imagens, mas no máximo 8s (não trava lote)
-        await waitFontsAndImages(page, 8000);
+        await page.waitForTimeout(120);
+        await quickWait(page, 1200);
 
         const pdfBuffer = await page.pdf({
           format: 'A4',
@@ -206,12 +218,11 @@ module.exports = async (req, res) => {
         zip.file(fname, pdfBuffer);
       } catch (e) {
         console.error(`Erro ao gerar PDF de ${baseName}:`, e);
-      } finally {
-        try { await page.close(); } catch (e) {}
       }
     }
 
-    try { await browser.close(); } catch (e) {}
+    await page.close();
+    await browser.close();
     browser = null;
 
     const zipBuffer = await zip.generateAsync({ type: 'nodebuffer' });
@@ -221,10 +232,7 @@ module.exports = async (req, res) => {
     return res.status(200).send(zipBuffer);
   } catch (error) {
     console.error('Erro geral na geração do lote:', error);
-    return res.status(500).json({
-      error: 'Erro interno ao gerar PDFs em lote.',
-      details: error.message
-    });
+    return res.status(500).json({ error: 'Erro interno ao gerar PDFs em lote.', details: error.message });
   } finally {
     if (browser) {
       try { await browser.close(); } catch (e) {}
