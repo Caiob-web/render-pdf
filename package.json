@@ -10,9 +10,9 @@
     "test": "echo \"No tests\" && exit 0"
   },
   "dependencies": {
-    "@sparticuz/chromium": "^143.0.4",
+    "@sparticuz/chromium": "^123.0.1",
     "jszip": "^3.10.1",
     "pdf-lib": "^1.17.1",
-    "puppeteer-core": "^24.35.0"
+    "puppeteer-core": "^23.11.1"
   }
 }
