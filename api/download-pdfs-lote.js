@@ -33,12 +33,11 @@ async function getJsonBody(req) {
   }
 }
 
-// chromium-min precisa do “pack .tar”. Vamos pegar a versão do próprio package.
+// chromium-min precisa do “pack .tar”
 function getPackUrl() {
   const arch = process.arch === 'arm64' ? 'arm64' : 'x64';
   let version = '143.0.4';
   try {
-    // pega a versão instalada do chromium-min (mais seguro)
     const pkg = require('@sparticuz/chromium-min/package.json');
     version = pkg.version || version;
   } catch (_) {}
@@ -56,11 +55,10 @@ async function getExecutablePath() {
   return _cachedExecutablePath;
 }
 
-// Lê o logo local do repo e vira data URI (sem depender de internet)
+// Lê o logo local do repo e vira data URI
 function getLogoDataUriFromLocalFile() {
   if (_cachedLogoDataUri) return _cachedLogoDataUri;
 
-  // /var/task/api -> subir um nível e achar /assets
   const logoPath = path.join(process.cwd(), 'assets', 'edp-logo.png');
 
   if (!fs.existsSync(logoPath)) {
@@ -71,41 +69,37 @@ function getLogoDataUriFromLocalFile() {
 
   const buf = fs.readFileSync(logoPath);
   const b64 = buf.toString('base64');
-
-  // PNG
   _cachedLogoDataUri = `data:image/png;base64,${b64}`;
   return _cachedLogoDataUri;
 }
 
-// Injeta o logo no HTML: troca a URL conhecida + força em <img alt="EDP Logo">
+// Injeta o logo no HTML
 function injectLogo(html, logoDataUri) {
   if (!logoDataUri) return html;
 
   let out = html;
 
-  // 1) troca a URL padrão (se existir no seu HTML)
   out = out.split(DEFAULT_LOGO_URL).join(logoDataUri);
 
-  // 2) troca qualquer URL seeklogo parecida (caso tenha variação)
   out = out.replace(
     /https?:\/\/images\.seeklogo\.com\/logo-png\/62\/2\/edp-logo-png_seeklogo-621425\.png/gi,
     logoDataUri
   );
 
-  // 3) “cirurgia”: qualquer <img ... alt="EDP Logo" ...> recebe src=logoDataUri
-  out = out.replace(/<img\b([^>]*?)\balt\s*=\s*["']EDP Logo["']([^>]*?)>/gi, (m, a, b) => {
-    // remove src antigo se existir
+  out = out.replace(/<img\b([^>]*?)\balt\s*=\s*["']EDP Logo["']([^>]*?)>/gi, (m) => {
     const cleaned = m.replace(/\bsrc\s*=\s*["'][^"']*["']/i, '');
-    // injeta src no começo da tag
     return cleaned.replace('<img', `<img src="${logoDataUri}"`);
   });
 
   return out;
 }
 
-// Espera fontes + imagens carregarem antes do PDF
-async function waitFontsAndImages(page) {
-  await page.evaluate(async () => {
+// Espera fontes + imagens, mas com limite de tempo (pra não travar o lote)
+async function waitFontsAndImages(page, maxMs = 8000) {
+  // Coloca um “timer” do lado do Node: se estourar, a gente segue
+  const guard = new Promise((resolve) => setTimeout(resolve, maxMs, 'timeout'));
+
+  const work = page.evaluate(async () => {
     // Fontes
     if (document.fonts && document.fonts.ready) {
       try { await document.fonts.ready; } catch (e) {}
@@ -118,11 +112,16 @@ async function waitFontsAndImages(page) {
         if (img.complete && img.naturalWidth > 0) return Promise.resolve();
         return new Promise((resolve) => {
           img.addEventListener('load', resolve, { once: true });
-          img.addEventListener('error', resolve, { once: true }); // não trava o lote
+          img.addEventListener('error', resolve, { once: true });
         });
       })
     );
+
+    return 'done';
   });
+
+  // Corre a corrida: terminou ou estourou tempo, seguimos
+  return Promise.race([work, guard]).catch(() => 'error');
 }
 
 // -------- Handler --------
@@ -145,9 +144,7 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'Nenhum item fornecido para geração.' });
     }
 
-    // ✅ pega logo local e transforma em data URI
     const logoDataUri = getLogoDataUriFromLocalFile();
-
     const executablePath = await getExecutablePath();
 
     browser = await puppeteer.launch({
@@ -156,6 +153,9 @@ module.exports = async (req, res) => {
       executablePath,
       headless: chromium.headless,
       ignoreHTTPSErrors: true,
+
+      // ✅ aqui é onde resolve seu erro
+      protocolTimeout: 180000 // 180s (3min)
     });
 
     const zip = new JSZip();
@@ -170,33 +170,36 @@ module.exports = async (req, res) => {
 
       const page = await browser.newPage();
 
+      // timeouts “globais” da página
+      page.setDefaultTimeout(120000);
+      page.setDefaultNavigationTimeout(120000);
+
       try {
-        // Logs úteis (se algo falhar de novo você vê no log da Vercel)
+        await page.emulateMediaType('print');
+
+        // (Opcional) log só de requests que interessam
         page.on('requestfailed', (r) => {
           const url = r.url();
-          if (url.includes('seeklogo') || url.includes('.png') || url.includes('.jpg')) {
+          if (url.includes('fonts.googleapis') || url.includes('gstatic') || url.includes('.png')) {
             console.error('REQUEST FAILED:', url, r.failure()?.errorText);
           }
         });
 
-        await page.emulateMediaType('print');
-
-        // ✅ injeta o logo no HTML (sem mexer no Base44)
         const htmlToRender = injectLogo(item.html, logoDataUri);
 
         await page.setContent(htmlToRender, {
           waitUntil: ['load', 'domcontentloaded', 'networkidle0'],
-          timeout: 60000,
+          timeout: 120000
         });
 
-        // ✅ garante que imagens/fontes entraram
-        await waitFontsAndImages(page);
+        // ✅ espera fontes/imagens, mas no máximo 8s (não trava lote)
+        await waitFontsAndImages(page, 8000);
 
         const pdfBuffer = await page.pdf({
           format: 'A4',
           printBackground: true,
           preferCSSPageSize: true,
-          margin: { top: '0', right: '0', bottom: '0', left: '0' },
+          margin: { top: '0', right: '0', bottom: '0', left: '0' }
         });
 
         const fname = baseName.toLowerCase().endsWith('.pdf') ? baseName : `${baseName}.pdf`;
@@ -220,7 +223,7 @@ module.exports = async (req, res) => {
     console.error('Erro geral na geração do lote:', error);
     return res.status(500).json({
       error: 'Erro interno ao gerar PDFs em lote.',
-      details: error.message,
+      details: error.message
     });
   } finally {
     if (browser) {
