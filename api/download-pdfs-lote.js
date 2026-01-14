@@ -2,11 +2,12 @@
 const puppeteer = require('puppeteer-core');
 const chromium = require('@sparticuz/chromium-min');
 const JSZip = require('jszip');
+const { setTimeout: sleep } = require('node:timers/promises'); // ✅ substitui waitForTimeout
 
 const DEFAULT_LOGO_URL_OLD =
   'https://images.seeklogo.com/logo-png/62/2/edp-logo-png_seeklogo-621425.png';
 
-// ✅ Seu logo novo (pode virar ENV depois)
+// ✅ Seu logo
 const DEFAULT_LOGO_URL_NEW =
   'https://captadores.org.br/wp-content/uploads/2024/08/edp.png';
 
@@ -66,7 +67,6 @@ async function getLogoDataUri() {
 
   const logoUrl = (process.env.EDP_LOGO_URL || DEFAULT_LOGO_URL_NEW).trim();
 
-  // timeout do fetch (10s)
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), 10000);
 
@@ -88,11 +88,11 @@ async function getLogoDataUri() {
   _cachedLogoDataUri = `data:${contentType};base64,${base64}`;
   _cachedLogoAt = now;
 
-  console.log('Logo baixado ok:', logoUrl, 'bytes:', Buffer.byteLength(base64, 'utf8'));
+  console.log('Logo baixado ok:', logoUrl, 'base64 chars:', base64.length);
   return _cachedLogoDataUri;
 }
 
-// remove dependências externas que podem travar (opcional, mas ajuda no serverless)
+// remove dependências externas (evita ficar preso em fontes)
 function stripExternalResources(html) {
   let out = html;
   out = out.replace(/<link[^>]+rel=["']preconnect["'][^>]*>\s*/gi, '');
@@ -106,7 +106,6 @@ function injectLogo(html, logoDataUri) {
   if (!logoDataUri) return html;
   let out = html;
 
-  // troca URL antiga e também a nova, se aparecerem no HTML
   out = out.split(DEFAULT_LOGO_URL_OLD).join(logoDataUri);
   out = out.split(DEFAULT_LOGO_URL_NEW).join(logoDataUri);
 
@@ -163,9 +162,7 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: 'Nenhum item fornecido para geração.' });
     }
 
-    // ✅ pega o logo do link e transforma em base64
     const logoDataUri = await getLogoDataUri();
-
     const executablePath = await getExecutablePath();
 
     browser = await puppeteer.launch({
@@ -196,15 +193,17 @@ module.exports = async (req, res) => {
       try {
         let html = item.html;
 
-        // ajuda a não travar em rede
         html = stripExternalResources(html);
-
-        // injeta o logo base64 (não depende mais de carregar imagem externa)
         html = injectLogo(html, logoDataUri);
 
-        await page.setContent(html, { waitUntil: ['domcontentloaded'], timeout: 120000 });
+        await page.setContent(html, {
+          waitUntil: ['domcontentloaded'],
+          timeout: 120000
+        });
 
-        await page.waitForTimeout(120);
+        // ✅ substitui page.waitForTimeout
+        await sleep(120);
+
         await quickWait(page, 1200);
 
         const pdfBuffer = await page.pdf({
@@ -232,7 +231,10 @@ module.exports = async (req, res) => {
     return res.status(200).send(zipBuffer);
   } catch (error) {
     console.error('Erro geral na geração do lote:', error);
-    return res.status(500).json({ error: 'Erro interno ao gerar PDFs em lote.', details: error.message });
+    return res.status(500).json({
+      error: 'Erro interno ao gerar PDFs em lote.',
+      details: error.message
+    });
   } finally {
     if (browser) {
       try { await browser.close(); } catch (e) {}
